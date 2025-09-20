@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, validator
 # Config
 # ====================================================
 MODEL_PATH = os.getenv("MODEL_PATH", "mlp_mejor_pipeline.joblib")
-MASTER_CSV_PATH = os.getenv("MASTER_CSV_PATH", "data/maestro_global_variables_municipio.csv")
+MASTER_CSV_PATH = "https://aprodigcodata.s3.eu-north-1.amazonaws.com/maestro_global_variables_municipio.csv"
 
 # ====================================================
 # Utilidades
@@ -45,8 +45,7 @@ def pick(colnames, candidates):
 # ====================================================
 # Carga maestro
 # ====================================================
-if not os.path.exists(MASTER_CSV_PATH):
-    raise RuntimeError(f"No se encontró MASTER_CSV_PATH: {MASTER_CSV_PATH}")
+
 
 maestro_raw = pd.read_csv(MASTER_CSV_PATH, dtype=str)
 maestro_raw.columns = maestro_raw.columns.str.strip()
