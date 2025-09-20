@@ -5,6 +5,7 @@ from dash import Dash, html, dcc, Input, Output, State
 import plotly.graph_objects as go
 from math import isnan
 from dash import no_update
+from dash.dcc import send_data_frame
 from joblib import load
 import re
 
@@ -279,6 +280,8 @@ app.layout = html.Div(
     style={"maxWidth":"1200px","margin":"0 auto","fontFamily":"system-ui, -apple-system, Segoe UI, Roboto, Arial","padding":"16px"},
     children=[
         dcc.Store(id="pred_mpio"),
+        dcc.Store(id="last_result"),
+        dcc.Download(id="download_results"),
         html.H2("Apropiación Digital en Colombia", style={"textAlign":"center","background":"#146c94","color":"white","padding":"10px","borderRadius":"8px"}),
 
         html.Div(style={"display":"grid","gridTemplateColumns":"1fr 1fr 1fr","gap":"16px"}, children=[
@@ -324,7 +327,24 @@ app.layout = html.Div(
                     id="p33_hint", style={"fontSize":"12px","color":"#666","marginTop":"8px"}
                 ),
                 html.Br(),
-                html.Button("Predecir", id="btn_predict", n_clicks=0, style={"padding":"10px 20px","fontWeight":"600"}),
+                html.Div(
+                [
+                    html.Button(
+                        "Predecir",
+                        id="btn_predict",
+                        n_clicks=0,
+                        style={"padding":"10px 20px","fontWeight":"600"}
+                    ),
+                    html.Button(
+                        "Descargar resultados",
+                        id="btn_download",
+                        n_clicks=0,
+                        disabled=True,                          # <- deshabilitado hasta predecir
+                        style={"marginLeft":"8px","padding":"10px 16px"}
+                    ),
+                ],
+                style={"display":"flex","alignItems":"center","gap":"8px"}
+            ),
             ]),
 
             # -------- Columna 3: Resultados --------
@@ -411,7 +431,18 @@ def _filter_mpios(depto_value, current_mpio):
     new_val = current_mpio if current_mpio in valid else (opts[0]["value"] if opts else None)
     return opts, new_val
 
-
+@app.callback(
+    Output("download_results","data"),
+    Input("btn_download","n_clicks"),
+    State("last_result","data"),
+    prevent_initial_call=True
+)
+def _download_results(n_clicks, data):
+    if not data:
+        return no_update
+    # data es un dict con una fila -> conviértelo a DataFrame
+    df = pd.DataFrame([data])
+    return send_data_frame(df.to_csv, "resultados_nivel_piramide.csv", index=False)
 
 @app.callback(
     Output("mapa_colombia_full","figure"),
@@ -616,7 +647,9 @@ def build_top_features_bar(names, scores, title=""):
     Output("error_area","children"),
     Output("error_area","style"),
     Output("debug_area","children"),
-    Output("pred_mpio","data"),   
+    Output("pred_mpio","data"), 
+    Output("btn_download","disabled"),          
+    Output("last_result","data"),                    
     Input("btn_predict","n_clicks"),
     State("depto_dropdown","value"),
     State("municipio_dropdown","value"),
@@ -627,10 +660,11 @@ def build_top_features_bar(names, scores, title=""):
     State("P33","value"),
     prevent_initial_call=True
 )
+
 def _predict(n_clicks, depto_code, municipio_code, RANGO_EDAD, ESTRATO, PB1_bin, SEXO_bin, P33):
     if not municipio_code:
         empty_fig = build_pyramid_figure(None, None), build_top_features_bar([], [])
-        return ("Seleccione un municipio.", empty_fig[0], empty_fig[1], "", {"display":"none"}, "", no_update)
+        return ("Seleccione un municipio.", empty_fig[0], empty_fig[1], "", {"display":"none"}, "", no_update, True, None)
     
 
     payload = {
@@ -645,8 +679,8 @@ def _predict(n_clicks, depto_code, municipio_code, RANGO_EDAD, ESTRATO, PB1_bin,
 
     url = f"{API_URL}/predict"
     try:
-        # 1) Call API to get INDICADOR (not NIVEL)
-        resp = requests.post(url, json={
+    # 1) API -> INDICADOR
+        payload_api = {
             "municipio_code": str(municipio_code),
             "RANGO_EDAD": float(RANGO_EDAD),
             "ESTRATO": float(ESTRATO),
@@ -654,74 +688,90 @@ def _predict(n_clicks, depto_code, municipio_code, RANGO_EDAD, ESTRATO, PB1_bin,
             "SEXO_bin": float(SEXO_bin),
             "P33": float(P33),
             "dept_code": str(depto_code).strip() if depto_code else None
-        }, timeout=20)
+        }
+        resp = requests.post(url, json=payload_api, timeout=20)
 
         if resp.status_code != 200:
             empty_py = build_pyramid_figure(None, None)
             empty_tf = build_top_features_bar([], [])
-            return ("",
-                    empty_py,
-                    empty_tf,
+            return ("", empty_py, empty_tf,
                     f"Error {resp.status_code} al llamar a la API: {resp.text}",
                     {"color":"#b00020","display":"block"},
-                    f"POST {url}\nPayload: {json.dumps({'municipio_code': str(municipio_code)})}",
-                    no_update)
+                    "",
+                    no_update,
+                    True,   # btn_download.disabled
+                    None)   # last_result.data
 
         data = resp.json()
         indicador_val = data.get("indicador") or data.get("INDICADOR") or data.get("prediction")
-        indicador_val = float(str(indicador_val).replace(",", "."))
-        indicador_text = f"{indicador_val:.4f}"   
         if indicador_val is None:
             empty_py = build_pyramid_figure(None, None)
             empty_tf = build_top_features_bar([], [])
-            return ("",
-                    empty_py,
-                    empty_tf,
+            return ("", empty_py, empty_tf,
                     f"La API no devolvió 'indicador'. Respuesta: {data}",
                     {"color":"#b00020","display":"block"},
-                    f"POST {url}\nPayload: {json.dumps({'municipio_code': str(municipio_code)})}",
-                    no_update)
+                    "",
+                    no_update,
+                    True,
+                    None)
+        
+        indicador_val = float(str(indicador_val).replace(",", "."))
+        indicador_text = f"{indicador_val:.4f}"
 
-        # 2) Assemble the model input row
+        # 2) Ensamblar entrada modelo
         if trained_pipe is None:
             empty_py = build_pyramid_figure(None, None)
             empty_tf = build_top_features_bar([], [])
-            return ("",
-                    empty_py,
-                    empty_tf,
+            return ("", empty_py, empty_tf,
                     "Modelo no cargado en el servidor (model_nivel_piramide.joblib).",
                     {"color":"#b00020","display":"block"},
                     "",
-                    no_update)
+                    no_update,
+                    True,
+                    None)
+
+        SEXO_orig = 1.0 if float(SEXO_bin) == 1.0 else 2.0
+
 
         X1, err = build_model_row(
             municipio_code=municipio_code,
             RANGO_EDAD=RANGO_EDAD,
             ESTRATO=ESTRATO,
             PB1_bin=PB1_bin,
-            SEXO_bin=SEXO_bin,
+            SEXO_bin=SEXO_orig,
             P33=P33,
-            indicador_value=float(indicador_val)
+            indicador_value=indicador_val
         )
         if err:
             empty_py = build_pyramid_figure(None, None)
             empty_tf = build_top_features_bar([], [])
-            return ("",
-                    empty_py,
-                    empty_tf,
+            return ("", empty_py, empty_tf,
                     err,
                     {"color":"#b00020","display":"block"},
                     "",
-                    no_update)
+                    no_update,
+                    True,
+                    None)
 
-        # 3) Predict NIVEL_PIRAMIDE with the loaded pipeline
+        # 3) Predicccón
         pred_class = int(trained_pipe.predict(X1)[0])
         proba = trained_pipe.predict_proba(X1)[0].tolist() if hasattr(trained_pipe, "predict_proba") else None
+        classes = list(trained_pipe.named_steps['clf'].classes_) if hasattr(trained_pipe.named_steps['clf'], "classes_") else []
 
-        # UI bits
-        pyramid_fig = build_pyramid_figure(pred_class=pred_class, class_probs=proba if proba and len(proba) == 4 else None)
-        top_feats_fig = build_top_features_bar(GLOBAL_TOP_FEAT_NAMES, GLOBAL_TOP_FEAT_SCORES) \
-                        if (GLOBAL_TOP_FEAT_NAMES and GLOBAL_TOP_FEAT_SCORES) else build_top_features_bar([], [])
+        pyramid_fig = build_pyramid_figure(pred_class=pred_class, class_probs=proba if (proba and len(proba)==4) else None)
+        top_feats_fig = build_top_features_bar(GLOBAL_TOP_FEAT_NAMES, GLOBAL_TOP_FEAT_SCORES) if (GLOBAL_TOP_FEAT_NAMES and GLOBAL_TOP_FEAT_SCORES) else build_top_features_bar([], [])
+
+        # 4) Armar payload para CSV (una fila) 
+
+        row_dict = X1.to_dict(orient='records')[0]
+        row_dict.update({
+            "municipio_code": str(municipio_code).zfill(5),
+            "depto_code": str(depto_code).strip() if depto_code else None,
+            "nivel_piramide_pred": int(pred_class),
+        })
+        if proba and classes:
+            for c, p in zip(classes, proba):
+                row_dict[f"p_{c}"] = p
 
         return (indicador_text,
                 pyramid_fig,
@@ -729,17 +779,21 @@ def _predict(n_clicks, depto_code, municipio_code, RANGO_EDAD, ESTRATO, PB1_bin,
                 "",
                 {"display":"none"},
                 "",
-                str(municipio_code).zfill(5))
+                str(municipio_code).zfill(5),
+                False,          # habilita botón descargar
+                row_dict)       # datos para CSV
     except Exception as e:
         empty_py = build_pyramid_figure(None, None)
         empty_tf = build_top_features_bar([], [])
-        return ("",
-                empty_py,                               # pyramid_graph figure
-                empty_tf,                               # top_features_graph figure
-                f"Falló la solicitud: {e}",             # error_area children
-                {"color":"#b00020","display":"block"},  # error_area style
-                f"POST {url}\nPayload: {json.dumps(payload, ensure_ascii=False)}",  # debug_area children
-                no_update)   
+        return (
+            "", empty_py, empty_tf,
+            "mensaje de error...",
+            {"color":"#b00020","display":"block"},
+            "debug opcional o ''",
+            no_update,
+            True,          # <-- deshabilitado
+            None           # <-- sin datos para descargar
+        )
 
 if __name__ == "__main__":
     # Dash >= 2.16
