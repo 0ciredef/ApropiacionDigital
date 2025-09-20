@@ -1,19 +1,55 @@
 import json
 import requests
-import pandas as pd
+import pandas as pd, json, urllib.request
 from dash import Dash, html, dcc, Input, Output, State
 import plotly.graph_objects as go
 from math import isnan
 from dash import no_update
+from joblib import load
 import re
 
 # =========================================
 # Configuración LOCAL (Opción B)
 # =========================================
+#BASE = "https://aprodigcodata.s3.eu-north-1.amazonaws.com"
 API_URL = "http://localhost:8000"  # tu FastAPI local
-MASTER_CSV_PATH = "data/maestro_global_variables_municipio.csv"
-GEOJSON_MPIO_PATH = "data/colombia_municipios.geojson"
+MASTER_CSV_PATH  = "https://aprodigcodata.s3.eu-north-1.amazonaws.com/maestro_global_variables_municipio.csv"
+GEOJSON_MPIO_PATH = "https://aprodigcodata.s3.eu-north-1.amazonaws.com/colombia_municipios.geojson"
 GEOJSON_ID_PROP   = "COD_MUNICIPIO" # propiedad del GeoJSON con el código DANE municipal
+MODEL_PATH = "model_nivel_piramide.joblib"
+
+# =========================================
+#Cargo modelo para predecir el Nivel de pirámide y obtengo importancia global de features
+# =========================================
+
+try:
+    trained_pipe = load(MODEL_PATH)  
+    clf = trained_pipe.named_steps['clf']
+
+    feature_names = getattr(trained_pipe.named_steps.get('scaler', None), 'feature_names_in_', None)
+except Exception as _e:
+    trained_pipe, clf, feature_names = None, None, None
+
+def get_global_logreg_importance(clf_obj, feat_names=None, top_k=10):
+    """
+    Returns a (names, scores) tuple for the most influential features across classes,
+    using mean absolute coefficients (features are standardized → magnitudes comparable).
+    """
+    import numpy as np
+    import pandas as pd
+
+    if clf_obj is None or not hasattr(clf_obj, "coef_"):
+        return [], []
+
+    coefs = pd.DataFrame(clf_obj.coef_)
+    if feat_names is not None and len(feat_names) == coefs.shape[1]:
+        coefs.columns = feat_names
+    # mean(|coef|) across classes
+    abs_mean = coefs.abs().mean(axis=0).sort_values(ascending=False)
+    abs_mean = abs_mean.head(top_k)
+    return list(abs_mean.index), list(abs_mean.values)
+
+GLOBAL_TOP_FEAT_NAMES, GLOBAL_TOP_FEAT_SCORES = get_global_logreg_importance(clf, feature_names, top_k=10)
 
 # =========================================
 # Cargar maestro (menús + labels)
@@ -92,6 +128,72 @@ def to_float(x):
     try: return float(x)
     except: return None
 
+# Creo un dataframe de un solo registro con las variables del modelo de predicción del Nivel de la Piramide 
+def build_model_row(municipio_code: str,
+                    RANGO_EDAD: float,
+                    ESTRATO: float,
+                    PB1_bin: float,
+                    SEXO_bin: float,
+                    P33: float,
+                    indicador_value: float):
+    """
+    Returns (df_row, err) where df_row is a 1-row DataFrame with columns ordered
+    as the trained pipeline saw them (using trained_pipe.named_steps['scaler'].feature_names_in_),
+    and err is an error string (or None).
+    """
+    try:
+        # Lookups from maestro for this municipio
+        code5 = str(municipio_code).zfill(5)
+        rowm = maestro.loc[maestro[COL_MPIO_COD] == code5].head(1)
+        if rowm.empty:
+            return None, f"No se encontró el municipio {code5} en el maestro."
+
+        indice = to_float(rowm.iloc[0][COL_INDICE])
+        ipm    = to_float(rowm.iloc[0][COL_IPM])
+        saber  = to_float(rowm.iloc[0][COL_SABER])
+
+        # PB = municipio code as int (your original data used DANE-like code)
+        PB = float(code5)  # scaler will standardize; keep numeric
+
+        # Build dict with all features your model likely used.
+        # Adjust names to EXACTLY match your training DataFrame column names.
+        feat_dict = {
+            "PB": PB,
+            "INDICADOR": float(indicador_value),
+            "RANGO_EDAD": float(RANGO_EDAD),
+            "PB1": float(PB1_bin),
+            "SEXO": float(SEXO_bin),
+            "ESTRATO": float(ESTRATO),
+            "P33": float(P33),
+            "ipm_depto": float(ipm) if ipm is not None else None,
+            "INDICE": float(indice) if indice is not None else None,
+            "saber_punt_global_mean": float(saber) if saber is not None else None,
+        }
+
+        # Align to model feature order; fall back to dict order if not available
+        if trained_pipe and hasattr(trained_pipe.named_steps.get('scaler', None), 'feature_names_in_'):
+            cols = list(trained_pipe.named_steps['scaler'].feature_names_in_)
+        else:
+            cols = list(feat_dict.keys())
+
+        # Ensure all expected columns exist
+        missing = [c for c in cols if c not in feat_dict]
+        if missing:
+            return None, f"Faltan columnas en el ensamblaje del modelo: {missing}"
+
+        import pandas as pd
+        X1 = pd.DataFrame([[feat_dict[c] for c in cols]], columns=cols)
+
+        # Basic NA check
+        if X1.isna().any().any():
+            na_cols = list(X1.columns[X1.isna().any()])
+            return None, f"Valores faltantes para el modelo en columnas: {na_cols}"
+
+        return X1, None
+    except Exception as e:
+        return None, f"Error armando features del modelo: {e}"
+
+
 def series_metric(metric_key: str):
     base = maestro.set_index(COL_MPIO_COD)
     if metric_key == "INDICE":
@@ -144,8 +246,10 @@ def geojson_locations_and_hover(geojson, z_series):
 # Carga GeoJSON LOCAL
 # =========================================
 
-with open(GEOJSON_MPIO_PATH, "r", encoding="utf-8") as f:
-    geojson_mpios = json.load(f)
+with urllib.request.urlopen(GEOJSON_MPIO_PATH) as r:
+    geojson_mpios = json.load(r)
+
+
 
 # Normaliza MpCodigo a 5 dígitos
 for feat in geojson_mpios.get("features", []):
@@ -167,6 +271,7 @@ for feat in geojson_mpios.get("features", []):
 # App Dash
 # =========================================
 app = Dash(__name__)
+server = app.server
 app.title = "Apropiación Digital en Colombia"
 
 app.layout = html.Div(
@@ -196,7 +301,7 @@ app.layout = html.Div(
                 html.Label("Estrato"),
                 dcc.Slider(id="ESTRATO", min=1, max=6, step=1, value=3, marks={i:str(i) for i in range(1,7)}),
                 html.Br(),
-                html.Label("Vivienda"),
+                html.Label("Vivienda (PB1)"),
                 dcc.Dropdown(id="PB1_bin", options=[{"label":"Urbana","value":1},{"label":"Rural","value":0}], value=1, clearable=False),
                 html.Br(),
                 
@@ -226,9 +331,15 @@ app.layout = html.Div(
             html.Div(style={"border":"1px solid #ddd","borderRadius":"10px","padding":"14px","background":"#eef8f0"},
                      children=[
                 html.H4("Resultados"),
-                html.Label("Índice de apropiación digital"),
+                html.Label("Indicador de apropiación digital"),
                 html.Div(id="prediction_area",
                          style={"border":"1px solid #ccc","padding":"14px","borderRadius":"8px","textAlign":"center","fontSize":"20px","background":"white"}),
+                html.Br(),
+                html.H5("Pirámide de apropiación (predicción)"),
+                dcc.Graph(id="pyramid_graph", config={"displayModeBar": False},style={"height":"260px"}),
+                html.H5("Variables más relevantes Nivel de la Pirámide"),
+                dcc.Graph(id="top_features_graph", config={"displayModeBar": False},style={"height":"300px"}),
+                
                 html.Br(),
                 html.H5("Indicadores del municipio"),
                 html.Div([
@@ -424,9 +535,84 @@ def _update_map_and_labels(mpio_from_dropdown, metric_key, mpio_pred):
 
     return fig, fmt(ipi), fmt(ipm), fmt(saber)
 
+def build_pyramid_figure(pred_class: int = None, class_probs: list = None):
+    import plotly.graph_objects as go
+
+    levels = [0, 1, 2, 3]  # 0 = nivel más alto, 3 = más bajo (ajusta si quieres)
+    labels = [f"Nivel {lvl}" for lvl in levels]
+    widths = [0.4, 0.65, 0.85, 1.0]
+
+    # y simplemente será [0,1,2,3]  (un valor por barra)
+    y = list(range(len(levels)))
+
+    def level_color(lvl):
+        return "#146c94" if pred_class == lvl else "#cfe8f3"
+
+    fig = go.Figure()
+    for lvl in levels:
+        txt = labels[lvl]
+        if class_probs and len(class_probs) == 4:
+            pct = f" ({class_probs[lvl]*100:.1f}%)"
+            txt += pct
+        fig.add_trace(go.Bar(
+            x=[widths[lvl]],
+            y=[lvl],                      # usa el mismo índice
+            orientation='h',
+            marker=dict(
+                color=level_color(lvl),
+                line=dict(color="#2a4d69", width=1 if pred_class == lvl else 0.5)
+            ),
+            hovertemplate=txt + "<extra></extra>",
+            text=[txt],
+            textposition="inside",
+            insidetextanchor="middle",
+            showlegend=False
+        ))
+
+    # Ahora alineamos ticks exactamente con y = [0,1,2,3]
+    fig.update_yaxes(
+        tickvals=levels,
+        ticktext=[f"Nivel {lvl}" for lvl in levels],
+        autorange="reversed",   # <- para que el 0 quede arriba y 3 abajo como pirámide
+        showgrid=False,
+        zeroline=False
+    )
+    fig.update_xaxes(visible=False, range=[0, 1.05])
+    fig.update_layout(
+        height=260,
+        margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)"
+    )
+    return fig
+
+
+def build_top_features_bar(names, scores, title=""):
+    import plotly.graph_objects as go
+    if not names or not scores:
+        return go.Figure()
+    fig = go.Figure(go.Bar(
+        x=scores[::-1],
+        y=names[::-1],
+        orientation='h',
+        marker=dict(line=dict(width=0))
+    ))
+    fig.update_layout(
+        height=300,
+        margin=dict(l=10, r=10, t=30, b=10),
+        title=title,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis_title="Imp. (|coef| medio)",
+        yaxis_title=""
+    )
+    return fig
+
 # La API enriquece IPI/IPM/Saber internamente (el front solo envía selecciones)
 @app.callback(
     Output("prediction_area","children"),
+    Output("pyramid_graph","figure"),            
+    Output("top_features_graph","figure"),       
     Output("error_area","children"),
     Output("error_area","style"),
     Output("debug_area","children"),
@@ -443,7 +629,9 @@ def _update_map_and_labels(mpio_from_dropdown, metric_key, mpio_pred):
 )
 def _predict(n_clicks, depto_code, municipio_code, RANGO_EDAD, ESTRATO, PB1_bin, SEXO_bin, P33):
     if not municipio_code:
-        return "Seleccione un municipio.", "", {"display":"none"}, ""
+        empty_fig = build_pyramid_figure(None, None), build_top_features_bar([], [])
+        return ("Seleccione un municipio.", empty_fig[0], empty_fig[1], "", {"display":"none"}, "", no_update)
+    
 
     payload = {
         "municipio_code": str(municipio_code),
@@ -457,29 +645,101 @@ def _predict(n_clicks, depto_code, municipio_code, RANGO_EDAD, ESTRATO, PB1_bin,
 
     url = f"{API_URL}/predict"
     try:
-        resp = requests.post(url, json=payload, timeout=20)
+        # 1) Call API to get INDICADOR (not NIVEL)
+        resp = requests.post(url, json={
+            "municipio_code": str(municipio_code),
+            "RANGO_EDAD": float(RANGO_EDAD),
+            "ESTRATO": float(ESTRATO),
+            "PB1_bin": float(PB1_bin),
+            "SEXO_bin": float(SEXO_bin),
+            "P33": float(P33),
+            "dept_code": str(depto_code).strip() if depto_code else None
+        }, timeout=20)
+
         if resp.status_code != 200:
+            empty_py = build_pyramid_figure(None, None)
+            empty_tf = build_top_features_bar([], [])
             return ("",
+                    empty_py,
+                    empty_tf,
                     f"Error {resp.status_code} al llamar a la API: {resp.text}",
                     {"color":"#b00020","display":"block"},
-                    f"POST {url}\nPayload: {json.dumps(payload, ensure_ascii=False)}",no_update)
+                    f"POST {url}\nPayload: {json.dumps({'municipio_code': str(municipio_code)})}",
+                    no_update)
+
         data = resp.json()
-        pred = data.get("prediction")
-        if pred is None:
+        indicador_val = data.get("indicador") or data.get("INDICADOR") or data.get("prediction")
+        indicador_val = float(str(indicador_val).replace(",", "."))
+        indicador_text = f"{indicador_val:.4f}"   
+        if indicador_val is None:
+            empty_py = build_pyramid_figure(None, None)
+            empty_tf = build_top_features_bar([], [])
             return ("",
-                    f"Respuesta inválida de la API: {data}",
+                    empty_py,
+                    empty_tf,
+                    f"La API no devolvió 'indicador'. Respuesta: {data}",
                     {"color":"#b00020","display":"block"},
-                    f"POST {url}\nPayload: {json.dumps(payload, ensure_ascii=False)}",no_update)
-        return (f"{pred:.4f}",
+                    f"POST {url}\nPayload: {json.dumps({'municipio_code': str(municipio_code)})}",
+                    no_update)
+
+        # 2) Assemble the model input row
+        if trained_pipe is None:
+            empty_py = build_pyramid_figure(None, None)
+            empty_tf = build_top_features_bar([], [])
+            return ("",
+                    empty_py,
+                    empty_tf,
+                    "Modelo no cargado en el servidor (model_nivel_piramide.joblib).",
+                    {"color":"#b00020","display":"block"},
+                    "",
+                    no_update)
+
+        X1, err = build_model_row(
+            municipio_code=municipio_code,
+            RANGO_EDAD=RANGO_EDAD,
+            ESTRATO=ESTRATO,
+            PB1_bin=PB1_bin,
+            SEXO_bin=SEXO_bin,
+            P33=P33,
+            indicador_value=float(indicador_val)
+        )
+        if err:
+            empty_py = build_pyramid_figure(None, None)
+            empty_tf = build_top_features_bar([], [])
+            return ("",
+                    empty_py,
+                    empty_tf,
+                    err,
+                    {"color":"#b00020","display":"block"},
+                    "",
+                    no_update)
+
+        # 3) Predict NIVEL_PIRAMIDE with the loaded pipeline
+        pred_class = int(trained_pipe.predict(X1)[0])
+        proba = trained_pipe.predict_proba(X1)[0].tolist() if hasattr(trained_pipe, "predict_proba") else None
+
+        # UI bits
+        pyramid_fig = build_pyramid_figure(pred_class=pred_class, class_probs=proba if proba and len(proba) == 4 else None)
+        top_feats_fig = build_top_features_bar(GLOBAL_TOP_FEAT_NAMES, GLOBAL_TOP_FEAT_SCORES) \
+                        if (GLOBAL_TOP_FEAT_NAMES and GLOBAL_TOP_FEAT_SCORES) else build_top_features_bar([], [])
+
+        return (indicador_text,
+                pyramid_fig,
+                top_feats_fig,
                 "",
                 {"display":"none"},
-                f"POST {url}\nPayload: {json.dumps(payload, ensure_ascii=False)}",
-                str(municipio_code).zfill(5)) 
+                "",
+                str(municipio_code).zfill(5))
     except Exception as e:
+        empty_py = build_pyramid_figure(None, None)
+        empty_tf = build_top_features_bar([], [])
         return ("",
-                f"Falló la solicitud: {e}",
-                {"color":"#b00020","display":"block"},
-                f"POST {url}\nPayload: {json.dumps(payload, ensure_ascii=False)}", no_update)
+                empty_py,                               # pyramid_graph figure
+                empty_tf,                               # top_features_graph figure
+                f"Falló la solicitud: {e}",             # error_area children
+                {"color":"#b00020","display":"block"},  # error_area style
+                f"POST {url}\nPayload: {json.dumps(payload, ensure_ascii=False)}",  # debug_area children
+                no_update)   
 
 if __name__ == "__main__":
     # Dash >= 2.16
