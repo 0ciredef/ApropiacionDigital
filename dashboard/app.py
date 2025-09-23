@@ -20,7 +20,7 @@ GEOJSON_ID_PROP   = "COD_MUNICIPIO" # propiedad del GeoJSON con el código DANE 
 MODEL_PATH = "model_nivel_piramide.joblib"
 
 # =========================================
-#Cargo modelo para predecir el Nivel de piramide y obtengo importancia global de features
+#Cargo modelo para predecir el Nivel de piramide y obtener importancia global de features
 # =========================================
 
 try:
