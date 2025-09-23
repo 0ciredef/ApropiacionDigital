@@ -112,7 +112,7 @@ NUM_FEATS = [
     "RANGO_EDAD","ESTRATO","PB1_bin","SEXO_bin",
     "P33","ipm_depto","INDICE","saber_punt_global_mean"
 ]
-CAT_FEATS = []  # si tu pipeline usó OneHot para dept_code:
+CAT_FEATS = []
 # CAT_FEATS = ["dept_code"]
 
 FEATURE_ORDER = NUM_FEATS + CAT_FEATS
